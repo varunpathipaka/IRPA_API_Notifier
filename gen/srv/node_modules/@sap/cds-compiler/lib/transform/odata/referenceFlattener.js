@@ -1,0 +1,290 @@
+const { forEachRef } = require('../../model/csnUtils');
+const { setProp } = require('../../base/model');
+const { implicitAs } = require('../../model/csnRefs');
+const { structuralPath } = require('./structuralPath');
+
+/** This class is used for generic reference flattening.
+ * It provides the following functionality:
+ * - attach the CSN location paths of object as $path property
+ * - resolve all references found in the CSN
+ * The resolved references and their paths are stored in the $paths property which is attached to the reference
+ * In addition, the items of the references will be checked if they point to structured elements,
+ * and the result will be cached in the "structuredReference" member variable.
+ * - register flattened elements - stored in the member variable "flattenedElementPaths"
+ * - check if a specific path points to a structured element
+ * - flatten of all references - combines already stored information to flatten the references
+ *
+ * Generic reference flattening works as follows:
+ * - resolve all references and there the single items
+ * - attach the resolved paths to the elements
+ * - during flattening of elements, transformers register all flattened paths
+ * - final flattening detects reference items which point to flattened elements
+ *   and joins both previous and current reference items
+ *
+ * Element transitions - when a structure is flattened, elements are moved from one location to another.
+ * Those transitions are registered in elementTransitions, where the origin path as key is mapped to the new path location.
+ * Used structure: elementTransitions[fromPath.toString()]=toPath.asPath()
+ * The key is the origin path joined with slash, new path is stored as path - array of strings.
+ * The corresponding functions are: registerElementTransition and getElementTransition.
+ */
+
+class ReferenceFlattener {
+
+  /**
+   * Reference flattening helper.
+   * @constructor
+   */
+  constructor() {
+    this.flattenedElementPaths = {};
+    this.structuredReference = {};
+    this.generatedElementsForPath = {};
+    this.elementTransitions = {};
+    this.elementNamesWithDots = {};
+  }
+
+  /**
+   * Resolves all references in the specified CSN and attaches the paths of resolved reference items
+   * as non-enumerable array of paths property called $paths.
+   * In addition stores information in structuredReference about each item in a reference if it points to a structered element in the CSN.
+   *
+   * @param {*} csn Specifies the CSN to process.
+   * @param {*} inspectRef Callback function performing the inspection of the references.
+   * @param {*} isStructured Callback function checking of an artifact is a structured element.
+   */
+  resolveAllReferences(csn, inspectRef, isStructured) {
+    forEachRef(csn, (_ref, node, path) => {
+      if (!path) return;
+      let resolved;
+      try {
+        resolved = inspectRef(path);
+      } catch (ex) {
+        return;  // TODO: fix tests: throw Error("Could not inspectRef: " + path.join("/"));
+      }
+      if (!resolved)
+        return; // TODO: fix tests: throw Error("Could not resolve: " + path.join("/"));
+      if (!resolved.links)
+        return; // TODO: fix tests:  throw Error("Could not resolve links: " + path.join("/"));
+      let paths = [];
+      resolved.links.forEach((element) => {
+        if (!element.art)
+          paths = undefined; // not resolved -> no paths
+        if (paths) {
+          paths.push(element.art.$path);
+        }
+      });
+      if (paths)
+        setProp(node, '$paths', paths);
+      // cache if structured or not
+      let structured = resolved.links.map(link => link.art ? (isStructured(link.art)) : undefined);
+      this.structuredReference[path.join('/')] = structured;
+    });
+  }
+
+  /**
+   * Checks if the provided path identifies a structured node in a CSN.
+   * It reuses the information collected from the resolveAllReferences function.
+   *
+   * @param {Array.<string>} path Array of node names identifying a node in a CSN.
+   * @returns {boolean}
+   */
+  isStructured(path) {
+    return this.structuredReference[path.join('/')];
+  }
+
+  /**
+   * During flattening of structured elements in a CSN,
+   * leaf-nodes are moved in the root the the artifact.
+   * This information is stored in form of source and target paths.
+   *
+   * @param {Array.<string>} fromPath Path of the source location.
+   * @param {Array.<string>} toPath Path of the destination location.
+   */
+  registerElementTransition(fromPath, toPath) {
+    let sFromPath = fromPath.join('/');
+    let sToPath = toPath.join('/');
+    if (sFromPath === sToPath) return; // same path -> no transition
+    this.elementTransitions[sFromPath] = toPath;
+  }
+
+  /**
+   * For specified path of a node in CSN,
+   * returns the transition path where the element was moved during the structure flattening.
+   * It reuses the collected information from function registerElementTransition.
+   *
+   * @param {Array.<string>} path The originating path of the node of interest.
+   * @returns {Array.<string>} The path of the target location in case of element transition.
+   */
+  getElementTransition(path) {
+    let sPath = path.join('/');
+    return this.elementTransitions[sPath];
+  }
+
+  /**
+   * During structure flattening inner structures will be joined.
+   * Each element joined with its children will be registered using its path in the CSN tree.
+   * This information will be used in the reference flattener to identify which items to join.
+   *
+   * @param {Array.<string>} path Path of the element in the CSN tree.
+   * @param {Array.<string>} originPath Path of the originating element.
+   */
+  registerFlattenedElement(path, originPath) {
+    let spath = path.join('/');
+    this.flattenedElementPaths[spath] = true;
+    if (originPath) {
+      let sOriginPath = originPath.join('/');
+      this.flattenedElementPaths[sOriginPath] = true;
+    }
+  }
+
+  /**
+   * During the flattening of structured elements new elements will be produced.
+   * The list of the new elements is stored under the path of the originating element used as key.
+   * The information will be used by the foreign key processing module.
+   *
+   * @param {Array.<string>} path Path of originating element.
+   * @param {Array.<string>} elementNames List of generated element names.
+   */
+  registerGeneratedElementsForPath(path, elementNames) {
+    this.generatedElementsForPath[path.join('/')] = elementNames;
+  }
+
+  /**
+   * Provides information about all generated elements for specific path in the CSN tree.
+   *
+   * @param {Array.<string>} path Path of the element to get the generated elements for.
+   * @returns {Array.<string>} List of generated names for the specified element path.
+   */
+  getGeneratedElementsForPath(path) {
+    return this.generatedElementsForPath[path.join('/')];
+  }
+
+  setElementNameWithDots(path, elementNameWithDots) {
+    this.elementNamesWithDots[path.join('/')] = elementNameWithDots;
+  }
+
+  getElementNameWithDots(path) {
+    return this.elementNamesWithDots[path.join('/')];
+  }
+
+  /**
+   * Generic reference flattener as {@link ReferenceFlattener described}.
+   *
+   * @param {*} csn
+   */
+  flattenAllReferences(csn) {
+    forEachRef(csn, (ref, node, path) => {
+      if (node.$paths) {
+        let newRef = []; // flattened reference
+        let flattenWithPrevious = false;
+        let lastFlattenedID = null; // The variable will be set to the index of the last flattened path
+        node.$paths.forEach((path, i) => {
+          if (path === undefined || !ref[i]) return;
+          let spath = path.join('/');
+          let movedTo = this.elementTransitions[spath]; // detect element transition
+          let flattened = this.flattenedElementPaths[spath];
+          if (flattenWithPrevious) {
+            newRef[newRef.length - 1] = newRef[newRef.length - 1] + '_' + (ref[i].id || ref[i]);
+            // if we have a filter or args in an assoc, it needs to be kept, therefore
+            // the id of the ref is updated with the flattened version
+            if (ref[i].id) {
+              ref[i].id = newRef[newRef.length - 1];
+              newRef[newRef.length - 1] = ref[i];
+            }
+            lastFlattenedID = i;
+          } else if(movedTo && i===0) { // handle local scope reference which is transitioned - replace first item in reference
+            let movedToElementName = movedTo[movedTo.length-1];
+            newRef.push(movedToElementName);
+            lastFlattenedID = i;
+          } else {
+            newRef.push(ref[i]);
+          }
+          flattenWithPrevious = flattened;
+        });
+        if (newRef !== undefined && lastFlattenedID !== null) { // make sure the reference changed and only then replace it with the new one
+          // check if this is a column and add alias if missing
+          let structural = structuralPath(csn, path);
+          if (isColumnInSelectOrProjection(structural)) {
+            if (!node.as && lastFlattenedID === ref.length-1) // attach alias only if there is none and it is the last item in the reference that was flattened
+              node.as = node.ref[node.ref.length - 1];
+          }
+          setProp(newRef, '$path', path.concat('ref'));
+          if (!node.as) {
+            if (isPartOfKeysStructure(structural))
+              node.as = implicitAs(node.ref);
+            else
+              setProp(node, 'as', implicitAs(node.ref))
+          }
+          node.ref = newRef;
+        }
+      }
+    })
+  }
+
+  applyAliasesInOnCond(csn, inspectRef) {
+    forEachRef(csn, (ref, node, path) => {
+      // Process only on-conditions of associations
+      let structural = structuralPath(csn, path);
+      if(!isOnCondition(structural)) return;
+      let { links } = inspectRef(path);
+      if(!links) return; // $user not resolvable
+      let keysOfPreviousStepWhenManagedAssoc = undefined;
+
+      let aliasedRef = [...ref];
+
+      for (let idx = 0; idx < ref.length; idx++) {
+        const currArt = links[idx].art;
+        if (keysOfPreviousStepWhenManagedAssoc) {
+          const usedKey = keysOfPreviousStepWhenManagedAssoc.find(key => key.ref[0] === ref[idx]);
+          if (usedKey && usedKey.as) {
+            aliasedRef.splice(idx, usedKey.ref.length, usedKey.as);
+            idx += usedKey.ref.length - 1;
+            keysOfPreviousStepWhenManagedAssoc = undefined;
+          }
+        } else {
+          keysOfPreviousStepWhenManagedAssoc =
+            (currArt.type === 'cds.Association' || currArt.type === 'cds.Composition') && currArt.keys;
+        }
+      }
+      node.ref = aliasedRef;
+    })
+  }
+}
+
+/**
+ * Checks if the provided path is a column inside a key node
+ * by exploring the possibility of the structural path to  ends with 'elements' and 'keys'.
+ *
+ * @param structural structural path to explore
+ * @returns {boolean} True if the provided path matched the requirements to be part of a key node.
+ */
+function isPartOfKeysStructure(structural) {
+  return structural[structural.length-2] === 'elements'
+      && structural[structural.length-1] === 'keys';
+}
+
+/**
+ * Checks if the provided path is a column inside a select or a projection node
+ * by exploring the possibility of the structural path to contain 'SELECT' or 'projection'
+ * and ends with 'columns' or 'columns' and 'expand'.
+ *
+ * @param structural structural path to explore
+ * @returns {boolean} True if the provided path matched the requirements to be a select node.
+ */
+function isColumnInSelectOrProjection(structural) {
+  return (structural.includes('SELECT') ||  structural.includes('projection'))
+    && (structural[structural.length-1] === 'columns' || (structural[structural.length-2] === 'columns' && structural[structural.length-1] === 'expand'));
+}
+
+/**
+ * Checks if the provided path is a column inside an on-condition of an element
+ * by exploring the possibility of the structural path to  ends with 'elements' and 'on'.
+ *
+ * @param structural structural path to explore
+ * @returns {boolean} True if the provided path matched the requirements to be part of an element's on-condition.
+ */
+function isOnCondition(structural) {
+  return structural[structural.length-2] === 'elements'
+      && structural[structural.length-1] === 'on';
+}
+
+module.exports = ReferenceFlattener;
